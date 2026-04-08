@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using TMPro;
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.Rendering;
 
 public class GraphVisualizer : MonoBehaviour
 {
@@ -42,6 +43,37 @@ public class GraphVisualizer : MonoBehaviour
     [Header("Edges")]
     [SerializeField] float edgeLineWidth = 0.06f;
     [SerializeField] Color edgeColor = new(0.2f, 0.75f, 1f, 0.9f);
+    [Tooltip("Directed 그래프: 간선·화살표 색 (무방향 시안과 대비, 시작은 더 투명)")]
+    [SerializeField] Color directedEdgeColor = new(1f, 0.48f, 0.18f, 0.97f);
+    [SerializeField] float directedArrowHeadLength = 0.28f;
+    [SerializeField] float directedArrowHeadBaseRadius = 0.095f;
+    [SerializeField] float directedArrowStemLength = 0.18f;
+    [SerializeField] float directedArrowStemRadius = 0.026f;
+    [Tooltip("화살 끝이 To 노드 쪽에 오도록 (0~1, 클수록 목적지에 가까움)")]
+    [SerializeField] float directedArrowTipNearT = 0.9f;
+    [Range(0f, 2f)]
+    [SerializeField] float directedEdgeEmission = 0.5f;
+    [Tooltip("Directed 간선 너비: 출발(가늘게) → 도착(굵게)")]
+    [SerializeField] float directedLineWidthStartMul = 0.72f;
+    [SerializeField] float directedLineWidthEndMul = 1.28f;
+    [Range(0.12f, 1f)]
+    [SerializeField] float directedLineAlphaStart = 0.34f;
+    [SerializeField] Material directedArrowMaterial;
+
+    [Header("Directed — 흐르는 네비게이션")]
+    [Tooltip("방향 간선 위를 따라 반투명 마커가 From → To로 이동")]
+    [SerializeField] bool directedFlowNavEnabled = true;
+    [Range(1, 4)]
+    [SerializeField] int directedFlowPulseCount = 2;
+    [SerializeField] float directedFlowOrbScale = 0.13f;
+    [Tooltip("간선 전체를 따라 펄스가 한 바퀴 도는 횟수(초당)")]
+    [SerializeField] float directedFlowCyclesPerSecond = 0.5f;
+    [Tooltip("노드 구 안쪽으로 들어가지 않게 양 끝에서 안쪽으로 띄움(월드 단위)")]
+    [SerializeField] float directedFlowEndInset = 0.34f;
+    [Tooltip("간선마다 시간 위상을 달리해 동시에 겹쳐 보이지 않게")]
+    [SerializeField] float directedFlowEdgePhaseSpread = 0.37f;
+    [Tooltip("반투명 구 색 — 알파로 투명도 조절")]
+    [SerializeField] Color directedFlowOrbColor = new(1f, 0.82f, 0.45f, 0.38f);
 
     [Header("Street — 보행·시뮬 통로")]
     [Tooltip("건물 사이 실제 ‘거리’ 폭. 나중에 에이전트는 이 폭 안을 다니게 맞추면 됨")]
@@ -98,6 +130,8 @@ public class GraphVisualizer : MonoBehaviour
     readonly Dictionary<int, Transform> _nodeTransforms = new();
     readonly List<LineRenderer> _edgeLines = new();
     readonly List<(int from, int to)> _edgePairs = new();
+    readonly List<Transform> _edgeArrowMarkers = new();
+    readonly List<Transform> _directedFlowRoots = new();
     readonly List<GameObject> _roads = new();
 
     GraphData _activeGraph;
@@ -111,9 +145,45 @@ public class GraphVisualizer : MonoBehaviour
     Material _runtimeCurbMaterial;
     Material _runtimeLineMaterial;
     Material _runtimeFacadeMaterial;
+    Material _directedArrowSharedMaterial;
+    Material _directedFlowSharedMaterial;
 
     static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
     static readonly int ColorId = Shader.PropertyToID("_Color");
+    static readonly int EmissionColorId = Shader.PropertyToID("_EmissionColor");
+    static readonly int SurfaceId = Shader.PropertyToID("_Surface");
+    static readonly int BlendId = Shader.PropertyToID("_Blend");
+    static readonly int ZWriteId = Shader.PropertyToID("_ZWrite");
+    static readonly int SrcBlendId = Shader.PropertyToID("_SrcBlend");
+    static readonly int DstBlendId = Shader.PropertyToID("_DstBlend");
+
+    static Mesh _directedArrowHeadMesh;
+
+    static Mesh GetDirectedArrowHeadMesh()
+    {
+        if (_directedArrowHeadMesh != null)
+            return _directedArrowHeadMesh;
+
+        const float tipY = 1f;
+        const float baseY = 0f;
+        const float r = 0.5f;
+        var rt = r * 0.8660254f;
+        var verts = new[]
+        {
+            new Vector3(0f, tipY, 0f),
+            new Vector3(0f, baseY, r),
+            new Vector3(-rt, baseY, -0.5f * r),
+            new Vector3(rt, baseY, -0.5f * r)
+        };
+        var tris = new[] { 0, 2, 1, 0, 3, 2, 0, 1, 3, 1, 2, 3 };
+        var mesh = new Mesh { name = "DirectedArrowHead" };
+        mesh.SetVertices(verts);
+        mesh.SetTriangles(tris, 0);
+        mesh.RecalculateNormals();
+        mesh.RecalculateBounds();
+        _directedArrowHeadMesh = mesh;
+        return _directedArrowHeadMesh;
+    }
 
     void Awake()
     {
@@ -121,6 +191,8 @@ public class GraphVisualizer : MonoBehaviour
         EnsureRoots();
         EnsureNodeSharedMaterial();
         EnsureStreetAccentMaterials();
+        EnsureDirectedArrowMaterial();
+        EnsureDirectedFlowMaterial();
     }
 
     void OnDestroy()
@@ -133,6 +205,80 @@ public class GraphVisualizer : MonoBehaviour
             Destroy(_runtimeLineMaterial);
         if (_runtimeFacadeMaterial != null)
             Destroy(_runtimeFacadeMaterial);
+        if (_directedArrowSharedMaterial != null)
+            Destroy(_directedArrowSharedMaterial);
+        if (_directedFlowSharedMaterial != null)
+            Destroy(_directedFlowSharedMaterial);
+    }
+
+    void EnsureDirectedArrowMaterial()
+    {
+        if (directedArrowMaterial != null) return;
+        var shader = Shader.Find("Universal Render Pipeline/Lit")
+                     ?? Shader.Find("Standard")
+                     ?? Shader.Find("Sprites/Default");
+        if (shader == null) return;
+        _directedArrowSharedMaterial = new Material(shader);
+        ApplyDirectedArrowMaterialLook(_directedArrowSharedMaterial);
+    }
+
+    void ApplyDirectedArrowMaterialLook(Material m)
+    {
+        if (m == null) return;
+        SetMaterialColor(m, directedEdgeColor);
+        if (m.HasProperty(EmissionColorId))
+        {
+            m.EnableKeyword("_EMISSION");
+            var e = directedEdgeColor * directedEdgeEmission;
+            e.a = 1f;
+            m.SetColor(EmissionColorId, e);
+        }
+    }
+
+    void EnsureDirectedFlowMaterial()
+    {
+        if (_directedFlowSharedMaterial != null)
+        {
+            ApplyDirectedFlowMaterialLook(_directedFlowSharedMaterial);
+            return;
+        }
+
+        var shader = Shader.Find("Universal Render Pipeline/Unlit")
+                     ?? Shader.Find("Universal Render Pipeline/Lit")
+                     ?? Shader.Find("Unlit/Transparent")
+                     ?? Shader.Find("Sprites/Default");
+        if (shader == null) return;
+
+        _directedFlowSharedMaterial = new Material(shader);
+        ApplyDirectedFlowMaterialLook(_directedFlowSharedMaterial);
+    }
+
+    void ApplyDirectedFlowMaterialLook(Material m)
+    {
+        if (m == null) return;
+        var c = directedFlowOrbColor;
+        SetMaterialColor(m, c);
+
+        m.renderQueue = (int)RenderQueue.Transparent;
+        if (m.HasProperty(SurfaceId))
+        {
+            m.SetFloat(SurfaceId, 1f);
+            if (m.HasProperty(BlendId))
+                m.SetFloat(BlendId, 0f);
+            if (m.HasProperty(ZWriteId))
+                m.SetFloat(ZWriteId, 0f);
+            if (m.HasProperty(SrcBlendId))
+                m.SetInt(SrcBlendId, (int)BlendMode.SrcAlpha);
+            if (m.HasProperty(DstBlendId))
+                m.SetInt(DstBlendId, (int)BlendMode.OneMinusSrcAlpha);
+        }
+
+        if (m.HasProperty(EmissionColorId))
+        {
+            m.EnableKeyword("_EMISSION");
+            var e = new Color(c.r, c.g, c.b, 1f) * (0.25f + c.a * 0.5f);
+            m.SetColor(EmissionColorId, e);
+        }
     }
 
     void EnsureStreetAccentMaterials()
@@ -214,6 +360,8 @@ public class GraphVisualizer : MonoBehaviour
             if (lr != null) Destroy(lr.gameObject);
         _edgeLines.Clear();
         _edgePairs.Clear();
+        _edgeArrowMarkers.Clear();
+        _directedFlowRoots.Clear();
 
         foreach (var r in _roads)
             if (r != null) Destroy(r);
@@ -240,7 +388,7 @@ public class GraphVisualizer : MonoBehaviour
             SpawnNode(kv.Key, kv.Value.Position);
 
         foreach (var edge in graph.Edges)
-            SpawnEdgeLine(edge.From, edge.To);
+            SpawnEdgeLine(edge.From, edge.To, graph.Directed);
 
         for (var i = 0; i < layoutIterations; i++)
             StepForceLayout(graph, layoutStep);
@@ -298,6 +446,8 @@ public class GraphVisualizer : MonoBehaviour
         }
 
         SetEdgeLinesVisible(false);
+        SetDirectedArrowMarkersVisible(false);
+        SetDirectedFlowNavRenderersVisible(graph.Directed && directedFlowNavEnabled);
     }
 
     bool TryGetEdgeXZSegment(GraphData graph, GraphEdgeData edge, out Vector2 start, out Vector2 end, out float lengthEff)
@@ -504,6 +654,7 @@ public class GraphVisualizer : MonoBehaviour
                 b.transform.localScale = new Vector3(foot, h, foot);
                 ApplyMaterialIfAny(b, facadeMat);
                 ApplyBuildingFacadeTint(b);
+                DestroyColliderIfPresent(b);
                 _roads.Add(b);
                 placed++;
             }
@@ -538,6 +689,7 @@ public class GraphVisualizer : MonoBehaviour
                 go.transform.localScale = new Vector3(w * 0.97f, hx, depthZ);
                 ApplyMaterialIfAny(go, mat);
                 ApplyBuildingFacadeTint(go);
+                DestroyColliderIfPresent(go);
                 _roads.Add(go);
             }
         }
@@ -559,6 +711,7 @@ public class GraphVisualizer : MonoBehaviour
                 go.transform.localScale = new Vector3(depthX, hx, w * 0.97f);
                 ApplyMaterialIfAny(go, mat);
                 ApplyBuildingFacadeTint(go);
+                DestroyColliderIfPresent(go);
                 _roads.Add(go);
             }
         }
@@ -629,6 +782,28 @@ public class GraphVisualizer : MonoBehaviour
     {
         foreach (var lr in _edgeLines)
             if (lr != null) lr.enabled = visible;
+    }
+
+    void SetDirectedArrowMarkersVisible(bool visible)
+    {
+        foreach (var marker in _edgeArrowMarkers)
+        {
+            if (marker == null) continue;
+            marker.gameObject.SetActive(visible);
+        }
+    }
+
+    void SetDirectedFlowNavRenderersVisible(bool visible)
+    {
+        foreach (var root in _directedFlowRoots)
+        {
+            if (root == null) continue;
+            for (var c = 0; c < root.childCount; c++)
+            {
+                var rend = root.GetChild(c).GetComponent<Renderer>();
+                if (rend != null) rend.enabled = visible;
+            }
+        }
     }
 
     void LateUpdate()
@@ -867,21 +1042,128 @@ public class GraphVisualizer : MonoBehaviour
         labelGo.AddComponent<NodeLabelBillboard>();
     }
 
-    void SpawnEdgeLine(int from, int to)
+    void SpawnEdgeLine(int from, int to, bool directed)
     {
-        var go = new GameObject($"Edge_{from}_{to}");
+        var go = new GameObject($"Edge_{from}_{to}_{_edgeLines.Count}");
         go.transform.SetParent(edgesRoot, false);
         var lr = go.AddComponent<LineRenderer>();
         lr.positionCount = 2;
-        lr.startWidth = edgeLineWidth;
-        lr.endWidth = edgeLineWidth;
         lr.useWorldSpace = true;
         lr.material = new Material(Shader.Find("Sprites/Default"));
-        lr.startColor = edgeColor;
-        lr.endColor = edgeColor;
-        lr.numCapVertices = 3;
+        if (directed)
+        {
+            lr.startWidth = edgeLineWidth * directedLineWidthStartMul;
+            lr.endWidth = edgeLineWidth * directedLineWidthEndMul;
+            var de = directedEdgeColor;
+            var grad = new Gradient();
+            grad.SetKeys(
+                new[] { new GradientColorKey(de, 0f), new GradientColorKey(Color.Lerp(de, Color.white, 0.15f), 1f) },
+                new[] { new GradientAlphaKey(Mathf.Clamp01(directedLineAlphaStart) * de.a, 0f), new GradientAlphaKey(Mathf.Min(1f, de.a), 1f) });
+            lr.colorGradient = grad;
+            lr.numCapVertices = 5;
+        }
+        else
+        {
+            lr.startWidth = edgeLineWidth;
+            lr.endWidth = edgeLineWidth;
+            lr.startColor = edgeColor;
+            lr.endColor = edgeColor;
+            lr.numCapVertices = 3;
+        }
+
         _edgeLines.Add(lr);
         _edgePairs.Add((from, to));
+
+        if (directed)
+        {
+            _edgeArrowMarkers.Add(SpawnDirectedArrowUnder(go.transform));
+            _directedFlowRoots.Add(directedFlowNavEnabled ? SpawnDirectedFlowNavUnder(go.transform) : null);
+        }
+        else
+        {
+            _edgeArrowMarkers.Add(null);
+            _directedFlowRoots.Add(null);
+        }
+    }
+
+    Transform SpawnDirectedFlowNavUnder(Transform parent)
+    {
+        EnsureDirectedFlowMaterial();
+        if (_directedFlowSharedMaterial == null)
+            return null;
+
+        var root = new GameObject("FlowNav").transform;
+        root.SetParent(parent, false);
+
+        var n = Mathf.Clamp(directedFlowPulseCount, 1, 4);
+        var sc = Mathf.Max(0.02f, directedFlowOrbScale);
+        for (var p = 0; p < n; p++)
+        {
+            var orb = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            orb.name = $"Pulse{p}";
+            orb.transform.SetParent(root, false);
+            orb.transform.localScale = Vector3.one * sc;
+            DestroyColliderIfPresent(orb);
+            var rend = orb.GetComponent<Renderer>();
+            if (rend != null)
+            {
+                rend.sharedMaterial = _directedFlowSharedMaterial;
+                rend.shadowCastingMode = ShadowCastingMode.Off;
+                rend.receiveShadows = false;
+            }
+        }
+
+        return root;
+    }
+
+    Transform SpawnDirectedArrowUnder(Transform parent)
+    {
+        var root = new GameObject("DirectionMarker").transform;
+        root.SetParent(parent, false);
+
+        Material mat;
+        if (directedArrowMaterial != null)
+            mat = directedArrowMaterial;
+        else
+        {
+            if (_directedArrowSharedMaterial != null)
+                ApplyDirectedArrowMaterialLook(_directedArrowSharedMaterial);
+            mat = _directedArrowSharedMaterial;
+        }
+
+        var headGo = new GameObject("ArrowHead");
+        headGo.transform.SetParent(root, false);
+        var mf = headGo.AddComponent<MeshFilter>();
+        mf.sharedMesh = GetDirectedArrowHeadMesh();
+        var mr = headGo.AddComponent<MeshRenderer>();
+        mr.sharedMaterial = mat;
+        mr.shadowCastingMode = ShadowCastingMode.Off;
+        mr.receiveShadows = false;
+
+        var br = Mathf.Max(0.01f, directedArrowHeadBaseRadius);
+        var hl = Mathf.Max(0.02f, directedArrowHeadLength);
+        headGo.transform.localScale = new Vector3(br * 2f, hl, br * 2f);
+
+        var stemLen = directedArrowStemLength;
+        var stemR = directedArrowStemRadius;
+        if (stemLen > 0.002f && stemR > 0.002f)
+        {
+            var stem = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+            stem.name = "ArrowStem";
+            stem.transform.SetParent(root, false);
+            DestroyColliderIfPresent(stem);
+            stem.transform.localScale = new Vector3(stemR * 2f, stemLen * 0.5f, stemR * 2f);
+            stem.transform.localPosition = new Vector3(0f, -stemLen * 0.5f, 0f);
+            var srend = stem.GetComponent<Renderer>();
+            if (srend != null)
+            {
+                srend.sharedMaterial = mat;
+                srend.shadowCastingMode = ShadowCastingMode.Off;
+                srend.receiveShadows = false;
+            }
+        }
+
+        return root;
     }
 
     void UpdateEdgeLines()
@@ -898,6 +1180,55 @@ public class GraphVisualizer : MonoBehaviour
                 continue;
             lr.SetPosition(0, na.Position);
             lr.SetPosition(1, nb.Position);
+
+            var full = nb.Position - na.Position;
+            var len = full.magnitude;
+            if (len < 1e-8f) continue;
+            var dir3 = full / len;
+
+            if (i < _edgeArrowMarkers.Count)
+            {
+                var tip = _edgeArrowMarkers[i];
+                if (tip != null)
+                {
+                    var tipWorld = na.Position + full * Mathf.Clamp01(directedArrowTipNearT);
+                    var hl = Mathf.Max(0.02f, directedArrowHeadLength);
+                    tip.position = tipWorld - dir3 * hl;
+                    tip.rotation = Quaternion.FromToRotation(Vector3.up, dir3);
+                }
+            }
+
+            if (i >= _directedFlowRoots.Count) continue;
+            var flowRoot = _directedFlowRoots[i];
+            if (flowRoot == null) continue;
+            if (!directedFlowNavEnabled)
+            {
+                flowRoot.gameObject.SetActive(false);
+                continue;
+            }
+
+            flowRoot.gameObject.SetActive(true);
+
+            var inset = Mathf.Min(directedFlowEndInset, len * 0.48f);
+            var segStart = na.Position + dir3 * inset;
+            var segEnd = nb.Position - dir3 * inset;
+            var seg = segEnd - segStart;
+            if (seg.sqrMagnitude < 1e-8f)
+            {
+                for (var c = 0; c < flowRoot.childCount; c++)
+                    flowRoot.GetChild(c).position = na.Position;
+                continue;
+            }
+
+            var invN = 1f / Mathf.Max(1, flowRoot.childCount);
+            var edgePhase = i * directedFlowEdgePhaseSpread;
+            var spd = directedFlowCyclesPerSecond;
+
+            for (var c = 0; c < flowRoot.childCount; c++)
+            {
+                var u = Mathf.Repeat(Time.time * spd + edgePhase + c * invN, 1f);
+                flowRoot.GetChild(c).position = segStart + seg * u;
+            }
         }
     }
 }

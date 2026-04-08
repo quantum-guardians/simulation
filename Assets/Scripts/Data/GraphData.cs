@@ -29,6 +29,7 @@ public class GraphEdgeData
 
 public class GraphData
 {
+    public bool Directed;
     public Dictionary<int, GraphNodeData> Nodes = new();
     public List<GraphEdgeData> Edges = new();
 }
