@@ -126,8 +126,10 @@ public sealed class SocialForceSimulator
                 var fromWall = agent.Position - closest;
                 var signedDist = Vector2.Dot(fromWall, wall.InwardNormal);
 
-                // Skip walls far away regardless of which side.
-                if (Mathf.Abs(signedDist) - agent.Radius > influence) continue;
+                // Skip walls the agent is clearly behind (junction: intersecting roads).
+                if (signedDist < -agent.Radius * 0.1f) continue;
+                // Skip walls too far in front.
+                if (signedDist - agent.Radius > influence) continue;
 
                 var surfaceDist = Mathf.Max(0f, signedDist);
                 var normal = signedDist >= -0.05f ? wall.InwardNormal
@@ -135,7 +137,9 @@ public sealed class SocialForceSimulator
                 var tangent = wall.Tangent;
 
                 var rawOverlap = agent.Radius - signedDist;
-                var overlap = Mathf.Clamp(rawOverlap, 0f, agent.Radius * 0.005f);
+                // Gentle cap: k=1.2e5 × 0.003 = 360N per wall.
+                // Enough to feel, won't fling agent across narrow roads.
+                var overlap = Mathf.Clamp(rawOverlap, 0f, 0.003f);
 
                 var social = p.SocialRepulsionStrength *
                     Mathf.Exp(Mathf.Clamp((agent.Radius - surfaceDist) / p.SafeSocialRepulsionRange, -20f, 20f));

@@ -14,9 +14,8 @@ public class SocialForceParameters
     [Tooltip("Relaxation time tau in seconds. Lower = faster acceleration toward desired velocity.")]
     public float RelaxationTime = 0.5f;
 
-    [Header("Forces")]
-    [Tooltip("Social repulsion strength A (N). Paper 2000; lowered for narrow roads.")]
-    public float SocialRepulsionStrength = 20f;
+    [Header("Forces")] [Tooltip("Social repulsion strength A (N). Paper 2000; lowered for narrow roads.")]
+    public float SocialRepulsionStrength = 0;//20f;
 
     [Tooltip("Social repulsion range B (m). Paper 0.08; widened for softer decay on narrow roads.")]
     public float SocialRepulsionRange = 0.5f;

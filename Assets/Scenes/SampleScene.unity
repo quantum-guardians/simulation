@@ -1838,7 +1838,7 @@ MonoBehaviour:
   socialForce:
     Mass: 80
     RelaxationTime: 0.5
-    SocialRepulsionStrength: 2000
+    SocialRepulsionStrength: 10
     SocialRepulsionRange: 0.08
     BodyForceStiffness: 120000
     SlidingFriction: 240000
@@ -1850,6 +1850,8 @@ MonoBehaviour:
     InjuryPressureDuration: 0.25
   nodeArrivalRadius: 0.45
   removeInjuredAgents: 0
+  drawWallGizmos: 1
+  wallGizmoColor: {r: 1, g: 0.3, b: 0.1, a: 0.7}
 --- !u!4 &1490354309
 Transform:
   m_ObjectHideFlags: 0
