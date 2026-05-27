@@ -1,9 +1,19 @@
 using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.Rendering;
 
 /// <summary>
-/// 도로 구간을 따라 이동하는 원통형 보행자. 명령 시 A*로 노드 경로를 따라갑니다.
+/// Unity-facing composition root for pedestrian crowd simulation.
+/// Domain movement is delegated to SocialForceSimulator.
+///
+/// Lifecycle:
+///   Awake()           → configure view factory
+///   OnRoadsBuilt()    → rebuild walk network and wall boundaries from graph
+///   AddOne/RemoveOne  → spawn/despawn agents
+///   FixedUpdate()     → update desired directions → assign destinations → SFM step → sync transforms
+///
+/// Each agent picks random start/destination nodes at spawn and navigates via A* pathfinding.
+/// When the destination is reached, a new random destination is assigned.
+/// A* results are cached per (from, to) node pair to avoid redundant path computations.
 /// </summary>
 public class PedestrianCrowdSim : MonoBehaviour
 {
@@ -12,101 +22,56 @@ public class PedestrianCrowdSim : MonoBehaviour
 
     [Header("보행")]
     [SerializeField] float walkSpeed = 1.15f;
-    [SerializeField] float lateralWander = 0.65f;
-    [Tooltip("명령 경로 추종 시 횡방향 흔들림 배율 (0에 가까울수록 직선)")]
-    [SerializeField] float commandLateralWanderMul = 0.15f;
-    [SerializeField] float cylinderRadiusXZ = 0.11f;
+    [SerializeField] float cylinderRadiusXZ = 0.3f;
     [SerializeField] float cylinderHeight = 0.52f;
     [SerializeField] Color pedestrianColor = new(0.92f, 0.88f, 0.82f, 1f);
     [SerializeField] Color selectedTint = new(0.45f, 0.95f, 1f, 1f);
 
-    [Header("압력(밀집 사망)")]
-    [SerializeField] float pressureRadius = 0.42f;
-    [Tooltip("이 반경 안의 다른 사람 수가 이 값 이상이면 사망 처리")]
-    [SerializeField] int pressureNeighborDeathThreshold = 5;
+    [Header("Social Force Model")]
+    [SerializeField] SocialForceParameters socialForce = new();
+    [SerializeField] float nodeArrivalRadius = 0.45f;
+    [Tooltip("When enabled, injured agents are removed from the scene instead of remaining as obstacles.")]
+    [SerializeField] bool removeInjuredAgents;
 
-    static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
-    static readonly int ColorId = Shader.PropertyToID("_Color");
+    [Header("Debug")]
+    [SerializeField] bool drawWallGizmos = true;
+    [SerializeField] Color wallGizmoColor = new(1f, 0.3f, 0.1f, 0.7f);
 
-    readonly List<WalkSegment> _segments = new();
-    readonly Dictionary<int, List<int>> _outgoing = new();
-    readonly Dictionary<int, List<(int to, float cost)>> _astarEdges = new();
-    readonly Dictionary<int, Vector3> _nodeWorld = new();
-    readonly List<PedestrianAgent> _agents = new();
+    readonly PedestrianAgentStore _store = new();
+    readonly PedestrianWalkNetwork _network = new();
+    readonly PedestrianViewFactory _views = new();
+    readonly PedestrianMotionController _motion = new();
+    readonly SocialForceSimulator _sfm = new();
 
-    Material _pedestrianMaterial;
-    MaterialPropertyBlock _mpb;
-    float _walkHalfWidth;
+    /// <summary>Caches A* path results keyed by (fromNode, toNode) pair.</summary>
+    readonly Dictionary<(int from, int to), System.Collections.Generic.List<int>> _pathCache = new();
+
     int _nextAgentId = 1;
     int? _selectedAgentId;
 
-    public int LivingCount => _agents.Count;
-    public float RoadSurfaceWorldY { get; private set; }
+    public int LivingCount => _store.Count;
 
-    struct PedestrianAgent
-    {
-        public int Id;
-        public Transform Transform;
-        public Renderer Renderer;
-        public int SegmentIndex;
-        public float T;
-        public float Lateral;
-        public List<int> CommandPath;
-        public int CommandTargetIdx;
-    }
+    /// <summary>Y coordinate of the road surface for world-space positioning.</summary>
+    public float RoadSurfaceWorldY => _network.RoadSurfaceWorldY;
 
     void Awake()
     {
-        EnsurePedestrianMaterial();
-        EnsureRoot();
-        _mpb = new MaterialPropertyBlock();
+        EnsureSocialForceParameters();
+        ConfigureViews();
     }
 
     void OnDestroy()
     {
-        if (_pedestrianMaterial != null)
-            Destroy(_pedestrianMaterial);
+        _views.Dispose();
     }
 
-    void EnsureRoot()
-    {
-        if (pedestriansRoot != null) return;
-        var go = new GameObject("Pedestrians");
-        go.transform.SetParent(transform, false);
-        pedestriansRoot = go.transform;
-    }
+    public bool HasAgentId(int agentId) => _store.ContainsId(agentId);
 
-    void EnsurePedestrianMaterial()
-    {
-        if (_pedestrianMaterial != null) return;
-        var shader = Shader.Find("Universal Render Pipeline/Lit")
-                     ?? Shader.Find("Standard")
-                     ?? Shader.Find("Unlit/Color");
-        if (shader == null) return;
-        _pedestrianMaterial = new Material(shader);
-        ApplyBaseColor(_pedestrianMaterial, pedestrianColor);
-    }
+    public SocialForceAgentState GetSfmState(int agentId) =>
+        _store.TryGetIndex(agentId, out var idx) ? _store.SfmAgents[idx] : null;
 
-    static void ApplyBaseColor(Material m, Color c)
-    {
-        if (m.HasProperty(BaseColorId))
-            m.SetColor(BaseColorId, c);
-        else if (m.HasProperty(ColorId))
-            m.SetColor(ColorId, c);
-        else
-            m.color = c;
-    }
-
-    public bool HasAgentId(int agentId)
-    {
-        for (var i = 0; i < _agents.Count; i++)
-        {
-            if (_agents[i].Id == agentId)
-                return true;
-        }
-
-        return false;
-    }
+    public PedestrianAgentRuntime GetRuntime(int agentId) =>
+        _store.TryGetIndex(agentId, out var idx) ? _store.Agents[idx] : null;
 
     public void SetSelectedAgentId(int? agentId)
     {
@@ -119,45 +84,24 @@ public class PedestrianCrowdSim : MonoBehaviour
 
     public bool TryNavigateSelectedTo(Vector3 worldPoint)
     {
-        if (!_selectedAgentId.HasValue)
-            return false;
-        return TryOrderMoveToWorldPoint(_selectedAgentId.Value, worldPoint);
+        return _selectedAgentId.HasValue &&
+               TryOrderMoveToWorldPoint(_selectedAgentId.Value, worldPoint);
     }
 
-    void RefreshAllHighlights()
-    {
-        for (var i = 0; i < _agents.Count; i++)
-            ApplyHighlight(_agents[i], _agents[i].Id == _selectedAgentId);
-    }
-
-    void ApplyHighlight(PedestrianAgent agent, bool selected)
-    {
-        if (agent.Renderer == null) return;
-        var c = selected ? Color.Lerp(pedestrianColor, selectedTint, 0.55f) : pedestrianColor;
-        _mpb.Clear();
-        if (agent.Renderer.sharedMaterial != null && agent.Renderer.sharedMaterial.HasProperty(BaseColorId))
-            _mpb.SetColor(BaseColorId, c);
-        else if (agent.Renderer.sharedMaterial != null && agent.Renderer.sharedMaterial.HasProperty(ColorId))
-            _mpb.SetColor(ColorId, c);
-        agent.Renderer.SetPropertyBlock(_mpb);
-    }
-
+    /// <summary>Destroys all agent GameObjects and clears internal state.</summary>
     public void ClearAllAgents()
     {
-        for (var i = 0; i < _agents.Count; i++)
-        {
-            var tr = _agents[i].Transform;
-            if (tr != null) Destroy(tr.gameObject);
-        }
-
-        _agents.Clear();
-        _segments.Clear();
-        _outgoing.Clear();
-        _astarEdges.Clear();
-        _nodeWorld.Clear();
+        ClearAgentViewsAndState();
+        _network.Clear(_sfm);
+        _pathCache.Clear();
         _selectedAgentId = null;
     }
 
+    /// <summary>
+    /// Called by GraphManager after road geometry is confirmed.
+    /// Rebuilds the walk network from graph data, creates wall boundaries,
+    /// clears path cache, and removes any existing agents.
+    /// </summary>
     public void OnRoadsBuilt(GraphData graph, float groundY)
     {
         if (visualizer == null || graph == null)
@@ -166,310 +110,422 @@ public class PedestrianCrowdSim : MonoBehaviour
             return;
         }
 
-        RoadSurfaceWorldY = visualizer.GetRoadSurfaceWorldY(groundY);
-        _walkHalfWidth = Mathf.Max(0.05f, visualizer.GetStreetWalkHalfWidth() - cylinderRadiusXZ);
-        visualizer.BuildWalkNetwork(graph, groundY, _segments, _outgoing);
-
-        _nodeWorld.Clear();
-        foreach (var kv in graph.Nodes)
-            _nodeWorld[kv.Key] = kv.Value.Position;
-
-        RebuildAstarEdges();
-
-        for (var i = _agents.Count - 1; i >= 0; i--)
-            DestroyAgentAt(i);
+        EnsureSocialForceParameters();
+        _network.Rebuild(visualizer, graph, groundY, cylinderRadiusXZ, socialForce, _sfm);
+        _pathCache.Clear();
+        ClearAgentViewsAndState();
+        _selectedAgentId = null;
     }
 
-    void RebuildAstarEdges()
-    {
-        _astarEdges.Clear();
-        var best = new Dictionary<(int from, int to), float>();
-        foreach (var seg in _segments)
-        {
-            var k = (seg.FromNode, seg.ToNode);
-            if (!best.TryGetValue(k, out var len) || seg.Length < len)
-                best[k] = seg.Length;
-        }
-
-        foreach (var kv in best)
-        {
-            if (!_astarEdges.TryGetValue(kv.Key.from, out var list))
-            {
-                list = new List<(int to, float cost)>();
-                _astarEdges[kv.Key.from] = list;
-            }
-
-            list.Add((kv.Key.to, kv.Value));
-        }
-    }
-
+    /// <summary>
+    /// Spawns a single pedestrian at a random position on a road segment.
+    /// Picks two random distinct graph nodes as start (placement near it) and destination.
+    /// Finds the A* path between them (with caching) and sets it as the agent's navigation path.
+    /// </summary>
     public void AddOne()
     {
-        if (_segments.Count == 0)
+        if (_network.Segments.Count == 0)
         {
-            Debug.LogWarning("[PedestrianCrowdSim] 도로가 없습니다. 먼저 그래프를 확정·빌드하세요.");
+            Debug.LogWarning("[PedestrianCrowdSim] No roads built. Build the graph first.");
             return;
         }
 
-        EnsurePedestrianMaterial();
-        EnsureRoot();
-
-        var si = Random.Range(0, _segments.Count);
-        var seg = _segments[si];
-        var t = Random.Range(0.05f, 0.95f);
-        var id = _nextAgentId++;
-
-        var go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-        go.name = $"Pedestrian_{id}";
-        go.transform.SetParent(pedestriansRoot, false);
-        go.transform.localScale = new Vector3(cylinderRadiusXZ * 2f, cylinderHeight * 0.5f, cylinderRadiusXZ * 2f);
-
-        var rend = go.GetComponent<Renderer>();
-        if (rend != null)
+        var nodeIds = _network.NodeIds;
+        if (nodeIds.Count < 2)
         {
-            rend.sharedMaterial = _pedestrianMaterial;
-            rend.shadowCastingMode = ShadowCastingMode.Off;
+            Debug.LogWarning("[PedestrianCrowdSim] Need at least 2 graph nodes.");
+            return;
         }
 
-        var unit = go.AddComponent<PedestrianUnit>();
-        unit.Initialize(this, id);
+        EnsureSocialForceParameters();
+        ConfigureViews();
 
-        var lat = Random.Range(-_walkHalfWidth * 0.35f, _walkHalfWidth * 0.35f);
-        PlaceOnSegment(go.transform, seg, t, lat);
+        // Pick random distinct start and destination nodes.
+        var startNode = nodeIds[Random.Range(0, nodeIds.Count)];
+        var destNode = startNode;
+        while (destNode == startNode)
+            destNode = nodeIds[Random.Range(0, nodeIds.Count)];
 
-        _agents.Add(new PedestrianAgent
+        // A* pathfinding with cache lookup.
+        if (!TryGetPath(startNode, destNode, out var path) || path.Count < 2)
+        {
+            Debug.LogWarning($"[PedestrianCrowdSim] No path from {startNode} to {destNode}.");
+            return;
+        }
+
+        // Find the segment from startNode (path[0]) to the first waypoint (path[1]).
+        var segmentIndex = _network.FindSegmentIndex(path[0], path[1]);
+        if (segmentIndex < 0)
+        {
+            Debug.LogWarning("[PedestrianCrowdSim] First segment of path not found.");
+            return;
+        }
+
+        var seg = _network.Segments[segmentIndex];
+
+        // Place agent along the first segment (t=0.05–0.95, not at endpoints).
+        // Add random lateral offset to distribute agents across the road width.
+        var t = Random.Range(0.05f, 0.95f);
+        var lateral = Random.Range(-_network.WalkHalfWidth * 0.35f, _network.WalkHalfWidth * 0.35f);
+        var startPos = PositionOnSegment(seg, t, lateral);
+        var id = _nextAgentId++;
+
+        var agent = _views.Create(id, cylinderRadiusXZ, cylinderHeight, startPos, seg.B - seg.A, this);
+        agent.SegmentIndex = segmentIndex;
+        agent.CommandPath = path; // Owned by cache — AdvancePathAtNode only reads, never modifies.
+        agent.CommandTargetIdx = 1; // Heading to path[1] (path[0] is the start node).
+        agent.TargetNodeId = seg.ToNode;
+
+        var sfm = new SocialForceAgentState
         {
             Id = id,
-            Transform = go.transform,
-            Renderer = rend,
-            SegmentIndex = si,
-            T = t,
-            Lateral = lat,
-            CommandPath = null,
-            CommandTargetIdx = 0
-        });
+            Position = ToXZ(startPos),
+            Velocity = Vector2.zero,
+            DesiredSpeed = walkSpeed,
+            DesiredDirection = DirectionTo(ToXZ(seg.B) - ToXZ(startPos)),
+            Radius = cylinderRadiusXZ,
+            Mass = socialForce.Mass,
+            CurrentEdgeMinNode = Mathf.Min(seg.FromNode, seg.ToNode),
+            CurrentEdgeMaxNode = Mathf.Max(seg.FromNode, seg.ToNode)
+        };
 
-        ApplyHighlight(_agents[_agents.Count - 1], id == _selectedAgentId);
+        _store.Add(agent, sfm);
+        _views.ApplyHighlight(agent, id == _selectedAgentId);
     }
 
+    /// <summary>Removes a random pedestrian. If it was the selected agent, deselects.</summary>
     public void RemoveOne()
     {
-        if (_agents.Count == 0) return;
-        var i = Random.Range(0, _agents.Count);
-        if (_selectedAgentId == _agents[i].Id)
+        if (_store.Count == 0) return;
+        var i = Random.Range(0, _store.Count);
+        if (_selectedAgentId == _store.Agents[i].Id)
             _selectedAgentId = null;
         DestroyAgentAt(i);
         RefreshAllHighlights();
     }
 
+    /// <summary>
+    /// Orders a specific agent to pathfind to a world point using A* on the road graph.
+    /// Overrides any existing random destination with a user command.
+    /// </summary>
     public bool TryOrderMoveToWorldPoint(int agentId, Vector3 worldPoint)
     {
-        if (_astarEdges.Count == 0 || _nodeWorld.Count == 0)
+        if (!_network.HasPathData || !_store.TryGetIndex(agentId, out var idx))
             return false;
 
-        var idx = -1;
-        for (var i = 0; i < _agents.Count; i++)
-        {
-            if (_agents[i].Id != agentId) continue;
-            idx = i;
-            break;
-        }
-
-        if (idx < 0) return false;
-
-        var start = NearestNodeId(_agents[idx].Transform.position);
-        var goal = NearestNodeId(worldPoint);
+        var start = _network.NearestNodeId(_store.Agents[idx].Transform.position);
+        var goal = _network.NearestNodeId(worldPoint);
         if (start < 0 || goal < 0) return false;
 
-        if (!RoadPathfinding.TryFindPath(start, goal, _astarEdges, _nodeWorld, out var path) || path.Count < 2)
+        // User commands use direct A* (no cache) since they are rare and cache isn't needed.
+        if (!RoadPathfinding.TryFindPath(start, goal, _network.AstarEdges, _network.NodeWorld, out var path) || path.Count < 2)
         {
-            Debug.LogWarning("[PedestrianCrowdSim] 목표까지 도로 그래프 경로를 찾지 못했습니다.");
+            Debug.LogWarning("[PedestrianCrowdSim] No path found to target.");
             return false;
         }
 
-        var segIdx = FindSegmentIndex(path[0], path[1]);
-        if (segIdx < 0)
+        var segmentIndex = _network.FindSegmentIndex(path[0], path[1]);
+        if (segmentIndex < 0)
         {
-            Debug.LogWarning("[PedestrianCrowdSim] 경로의 첫 간선을 찾지 못했습니다.");
+            Debug.LogWarning("[PedestrianCrowdSim] First edge of path not found.");
             return false;
         }
 
-        var a = _agents[idx];
-        a.CommandPath = path;
-        a.CommandTargetIdx = 1;
-        a.SegmentIndex = segIdx;
-        a.T = 0.02f;
-        a.Lateral = 0f;
-        _agents[idx] = a;
+        var agent = _store.Agents[idx];
+        agent.CommandPath = path;
+        agent.CommandTargetIdx = 1;
+        agent.SegmentIndex = segmentIndex;
+        agent.TargetNodeId = _network.Segments[segmentIndex].ToNode;
 
-        PlaceOnSegment(a.Transform, _segments[segIdx], a.T, a.Lateral);
+        var sfm = _store.SfmAgents[idx];
+        var seg = _network.Segments[segmentIndex];
+        sfm.DesiredDirection = DirectionTo(ToXZ(seg.B) - sfm.Position);
+        sfm.DesiredSpeed = walkSpeed;
+        sfm.CurrentEdgeMinNode = Mathf.Min(seg.FromNode, seg.ToNode);
+        sfm.CurrentEdgeMaxNode = Mathf.Max(seg.FromNode, seg.ToNode);
         return true;
     }
 
-    int NearestNodeId(Vector3 p)
+    /// <summary>
+    /// Main simulation tick (FixedUpdate).
+    /// 1. Update desired directions from path graph.
+    /// 2. Assign new random destinations to agents that completed their previous paths.
+    /// 3. Step the social force simulator (force computation + integration).
+    /// 4. Sync SFM state back to Unity transforms.
+    /// 5. Remove injured agents (if policy enabled).
+    /// </summary>
+    void FixedUpdate()
     {
-        var best = -1;
-        var bd = float.MaxValue;
-        foreach (var kv in _nodeWorld)
-        {
-            var q = kv.Value;
-            var d = (new Vector2(q.x - p.x, q.z - p.z)).sqrMagnitude;
-            if (d < bd)
-            {
-                bd = d;
-                best = kv.Key;
-            }
-        }
+        if (_network.Segments.Count == 0 || _store.Count == 0) return;
 
-        return best;
+        _motion.UpdateDesiredDirections(_store, _network, nodeArrivalRadius, walkSpeed);
+        AssignNewDestinations();
+        _sfm.Step(_store.SfmAgents, socialForce, Time.fixedDeltaTime);
+        SyncViewsFromDomain();
+        ApplyInjuryPolicy();
     }
 
-    int FindSegmentIndex(int fromNode, int toNode)
+    /// <summary>
+    /// After motion update, scans for agents whose CommandPath was just exhausted
+    /// (destination reached) and assigns a new random destination via A*.
+    ///
+    /// An exhausted path means CommandPath is null but the agent is healthy (not injured).
+    /// The MotionController already set a random fallback segment — we override it
+    /// with the first segment of the new A* path.
+    /// </summary>
+    void AssignNewDestinations()
     {
-        for (var i = 0; i < _segments.Count; i++)
+        var nodeIds = _network.NodeIds;
+        if (nodeIds.Count < 2) return;
+
+        for (var i = 0; i < _store.Count; i++)
         {
-            var s = _segments[i];
-            if (s.FromNode == fromNode && s.ToNode == toNode)
-                return i;
+            var agent = _store.Agents[i];
+            if (agent.CommandPath != null) continue;
+            if (_store.SfmAgents[i].IsInjuredObstacle) continue;
+
+            var current = _network.NearestNodeId(agent.Transform.position);
+            if (current < 0) continue;
+
+            // Pick a random destination different from the current node.
+            var dest = current;
+            while (dest == current)
+                dest = nodeIds[Random.Range(0, nodeIds.Count)];
+
+            if (!TryGetPath(current, dest, out var path) || path.Count < 2) continue;
+
+            var segmentIndex = _network.FindSegmentIndex(path[0], path[1]);
+            if (segmentIndex < 0) continue;
+
+            agent.CommandPath = path;
+            agent.CommandTargetIdx = 1;
+            agent.SegmentIndex = segmentIndex;
+            agent.TargetNodeId = _network.Segments[segmentIndex].ToNode;
+
+            var sfm = _store.SfmAgents[i];
+            var seg = _network.Segments[segmentIndex];
+            sfm.DesiredDirection = DirectionTo(ToXZ(seg.B) - sfm.Position);
+            sfm.DesiredSpeed = walkSpeed;
+            sfm.CurrentEdgeMinNode = Mathf.Min(seg.FromNode, seg.ToNode);
+            sfm.CurrentEdgeMaxNode = Mathf.Max(seg.FromNode, seg.ToNode);
+        }
+    }
+
+    /// <summary>
+    /// Returns a cached or newly-computed A* path between two nodes.
+    /// Cache key is the (from, to) pair. Since paths are read-only
+    /// (AdvancePathAtNode only reads indices, never mutates the list),
+    /// multiple agents can safely share the same cached list reference.
+    /// </summary>
+    bool TryGetPath(int from, int to, out System.Collections.Generic.List<int> path)
+    {
+        var key = (from, to);
+        if (_pathCache.TryGetValue(key, out path))
+            return true;
+
+        if (RoadPathfinding.TryFindPath(from, to, _network.AstarEdges, _network.NodeWorld, out path))
+        {
+            _pathCache[key] = path;
+            return true;
         }
 
-        return -1;
+        return false;
+    }
+
+    void ConfigureViews()
+    {
+        _views.Configure(transform, pedestriansRoot, pedestrianColor, selectedTint);
+        pedestriansRoot = _views.Root;
+    }
+
+    void EnsureSocialForceParameters()
+    {
+        socialForce ??= new SocialForceParameters();
+    }
+
+    void ClearAgentViewsAndState()
+    {
+        for (var i = 0; i < _store.Count; i++)
+            _views.DestroyAgent(_store.Agents[i]);
+        _store.Clear();
     }
 
     void DestroyAgentAt(int index)
     {
-        var tr = _agents[index].Transform;
-        if (tr != null) Destroy(tr.gameObject);
-        _agents.RemoveAt(index);
+        _views.DestroyAgent(_store.Agents[index]);
+        _store.RemoveAt(index);
     }
 
-    void FixedUpdate()
+    /// <summary>Copies SFM positions and velocities back to Unity transforms.</summary>
+    void SyncViewsFromDomain()
     {
-        if (_segments.Count == 0 || _agents.Count == 0) return;
-
-        var dt = Time.fixedDeltaTime;
-        for (var i = 0; i < _agents.Count; i++)
+        for (var i = 0; i < _store.Count; i++)
         {
-            var a = _agents[i];
-            StepAgent(ref a, dt);
-            _agents[i] = a;
+            var sfm = _store.SfmAgents[i];
+            var agent = _store.Agents[i];
+
+            // Convert XZ position back to 3D world space (Y = road surface height).
+            agent.Transform.position = ToWorld(sfm.Position);
+
+            // Only rotate when moving fast enough to avoid jitter.
+            if (sfm.Velocity.sqrMagnitude > 0.01f)
+                PedestrianViewFactory.FaceAlong(agent.Transform, new Vector3(sfm.Velocity.x, 0f, sfm.Velocity.y));
         }
-
-        ApplyPressureDeaths();
     }
 
-    void StepAgent(ref PedestrianAgent agent, float dt)
+    /// <summary>Removes injured agents when removeInjuredAgents is enabled.</summary>
+    void ApplyInjuryPolicy()
     {
-        if (agent.SegmentIndex < 0 || agent.SegmentIndex >= _segments.Count) return;
+        if (!removeInjuredAgents)
+            return;
 
-        var seg = _segments[agent.SegmentIndex];
-        var fwd = seg.B - seg.A;
-        if (fwd.sqrMagnitude < 1e-8f) return;
-        fwd.Normalize();
-        var right = Vector3.Cross(Vector3.up, fwd).normalized;
-
-        var latMul = agent.CommandPath != null ? commandLateralWanderMul : 1f;
-        agent.Lateral += (Random.value - 0.5f) * 2f * lateralWander * latMul * dt;
-        agent.Lateral = Mathf.Clamp(agent.Lateral, -_walkHalfWidth, _walkHalfWidth);
-
-        var speedAlong = walkSpeed / Mathf.Max(0.01f, seg.Length);
-        agent.T += speedAlong * dt;
-
-        if (agent.T >= 1f)
+        for (var i = _store.Count - 1; i >= 0; i--)
         {
-            var toNode = seg.ToNode;
-            agent.T = 0f;
-
-            if (agent.CommandPath != null &&
-                agent.CommandTargetIdx < agent.CommandPath.Count &&
-                toNode == agent.CommandPath[agent.CommandTargetIdx])
-            {
-                agent.CommandTargetIdx++;
-                if (agent.CommandTargetIdx >= agent.CommandPath.Count)
-                {
-                    agent.CommandPath = null;
-                    agent.CommandTargetIdx = 0;
-                }
-            }
-
-            agent.SegmentIndex = PickNextSegmentIndex(toNode, ref agent);
-            seg = _segments[agent.SegmentIndex];
-        }
-
-        PlaceOnSegment(agent.Transform, seg, agent.T, agent.Lateral);
-    }
-
-    int PickNextSegmentIndex(int atNode, ref PedestrianAgent agent)
-    {
-        if (agent.CommandPath != null &&
-            agent.CommandTargetIdx < agent.CommandPath.Count &&
-            _outgoing.TryGetValue(atNode, out var outs))
-        {
-            var target = agent.CommandPath[agent.CommandTargetIdx];
-            var candidates = new List<int>(4);
-            foreach (var si in outs)
-            {
-                if (_segments[si].ToNode == target)
-                    candidates.Add(si);
-            }
-
-            if (candidates.Count > 0)
-                return candidates[Random.Range(0, candidates.Count)];
-        }
-
-        if (_outgoing.TryGetValue(atNode, out var outs2) && outs2.Count > 0)
-            return outs2[Random.Range(0, outs2.Count)];
-
-        if (_segments.Count == 0) return 0;
-        return Random.Range(0, _segments.Count);
-    }
-
-    static void PlaceOnSegment(Transform tr, WalkSegment seg, float t, float lateral)
-    {
-        var fwd = seg.B - seg.A;
-        fwd.Normalize();
-        var right = Vector3.Cross(Vector3.up, fwd).normalized;
-        var p = Vector3.Lerp(seg.A, seg.B, Mathf.Clamp01(t)) + right * lateral;
-        tr.position = p;
-        if (fwd.sqrMagnitude > 1e-8f)
-            tr.rotation = Quaternion.LookRotation(fwd, Vector3.up);
-    }
-
-    void ApplyPressureDeaths()
-    {
-        var n = _agents.Count;
-        if (n == 0) return;
-
-        var r = pressureRadius;
-        var r2 = r * r;
-        var need = Mathf.Max(1, pressureNeighborDeathThreshold);
-        var kill = new bool[n];
-
-        for (var i = 0; i < n; i++)
-        {
-            var pi = _agents[i].Transform.position;
-            var cnt = 0;
-            for (var j = 0; j < n; j++)
-            {
-                if (i == j) continue;
-                if ((_agents[j].Transform.position - pi).sqrMagnitude <= r2)
-                    cnt++;
-                if (cnt >= need) break;
-            }
-
-            if (cnt >= need)
-                kill[i] = true;
-        }
-
-        for (var i = n - 1; i >= 0; i--)
-        {
-            if (!kill[i]) continue;
-            if (_selectedAgentId == _agents[i].Id)
+            if (!_store.SfmAgents[i].IsInjuredObstacle) continue;
+            if (_selectedAgentId == _store.Agents[i].Id)
                 _selectedAgentId = null;
             DestroyAgentAt(i);
         }
 
         if (_selectedAgentId.HasValue)
             RefreshAllHighlights();
+    }
+
+    void RefreshAllHighlights()
+    {
+        for (var i = 0; i < _store.Count; i++)
+            _views.ApplyHighlight(_store.Agents[i], _store.Agents[i].Id == _selectedAgentId);
+    }
+
+    /// <summary>Converts an XZ Vector2 to a 3D world position (Y = road surface height).</summary>
+    Vector3 ToWorld(Vector2 p) => new(p.x, _network.RoadSurfaceWorldY, p.y);
+
+    /// <summary>Extracts XZ components from a 3D world position.</summary>
+    static Vector2 ToXZ(Vector3 p) => new(p.x, p.z);
+
+    static Vector2 DirectionTo(Vector2 v) => v.sqrMagnitude > 1e-6f ? v.normalized : Vector2.zero;
+
+    /// <summary>
+    /// Computes a position along a road segment at parameter t (0=A, 1=B) with a lateral offset.
+    /// Lateral offset is perpendicular to the segment direction.
+    /// </summary>
+    static Vector3 PositionOnSegment(WalkSegment seg, float t, float lateral)
+    {
+        var fwd = seg.B - seg.A;
+        fwd.Normalize();
+        var right = Vector3.Cross(Vector3.up, fwd).normalized;
+        return Vector3.Lerp(seg.A, seg.B, Mathf.Clamp01(t)) + right * lateral;
+    }
+
+    void OnDrawGizmos()
+    {
+        if (!drawWallGizmos) return;
+
+        var y = _network.RoadSurfaceWorldY;
+        if (_network.AllWalls.Count > 0)
+            DrawWalls(y);
+        if (_network.Segments.Count > 0)
+            DrawRoadSurfaces(y);
+        if (_store.Count > 0)
+            DrawAgents(y);
+    }
+
+    void DrawWalls(float y)
+    {
+#if UNITY_EDITOR
+        UnityEditor.Handles.color = wallGizmoColor;
+        foreach (var wall in _network.AllWalls)
+        {
+            var a = new Vector3(wall.A.x, y, wall.A.y);
+            var b = new Vector3(wall.B.x, y, wall.B.y);
+            var mid = (a + b) * 0.5f;
+            UnityEditor.Handles.DrawLine(a, b, 3f);
+            var normalEnd = mid + new Vector3(wall.InwardNormal.x, 0f, wall.InwardNormal.y) * 0.4f;
+            UnityEditor.Handles.DrawLine(mid, normalEnd, 2f);
+        }
+
+        // Junction circles.
+        if (_network.JunctionRadius > 0f)
+        {
+            UnityEditor.Handles.color = new Color(1f, 1f, 0f, 0.25f);
+            foreach (var kv in _network.NodeWorld)
+            {
+                var center = new Vector3(kv.Value.x, y, kv.Value.z);
+                DrawHandleCircle(center, _network.JunctionRadius, 24, 2f);
+            }
+        }
+#else
+        Gizmos.color = wallGizmoColor;
+        foreach (var wall in _network.AllWalls)
+        {
+            var a = new Vector3(wall.A.x, y, wall.A.y);
+            var b = new Vector3(wall.B.x, y, wall.B.y);
+            Gizmos.DrawLine(a, b);
+        }
+#endif
+    }
+
+#if UNITY_EDITOR
+    static void DrawHandleCircle(Vector3 center, float radius, int segments, float thickness)
+    {
+        var step = Mathf.PI * 2f / segments;
+        var prev = center + new Vector3(Mathf.Cos(0f) * radius, 0f, Mathf.Sin(0f) * radius);
+        for (var i = 1; i <= segments; i++)
+        {
+            var angle = step * i;
+            var next = center + new Vector3(Mathf.Cos(angle) * radius, 0f, Mathf.Sin(angle) * radius);
+            UnityEditor.Handles.DrawLine(prev, next, thickness);
+            prev = next;
+        }
+    }
+#endif
+
+    void DrawRoadSurfaces(float y)
+    {
+        // Draw road centerlines and walkable area (semi-transparent).
+        var seen = new System.Collections.Generic.HashSet<(int, int)>();
+        foreach (var seg in _network.Segments)
+        {
+            var key = seg.FromNode < seg.ToNode ? (seg.FromNode, seg.ToNode) : (seg.ToNode, seg.FromNode);
+            if (!seen.Add(key)) continue;
+
+            var a = new Vector3(seg.A.x, y, seg.A.z);
+            var b = new Vector3(seg.B.x, y, seg.B.z);
+            var d = b - a;
+            if (d.sqrMagnitude < 1e-6f) continue;
+
+            var fwd = d.normalized;
+            var left = new Vector3(-fwd.z, 0f, fwd.x); // XZ left = (-fwd.y, fwd.x) → in 3D: (-fwd.z, 0, fwd.x)
+            var halfWidth = _network.WalkHalfWidth + cylinderRadiusXZ; // roadHalfWidth
+
+            // Centerline.
+            Gizmos.color = new Color(0.3f, 0.6f, 1f, 0.4f);
+            Gizmos.DrawLine(a, b);
+
+            // Walkable edge lines.
+            Gizmos.color = new Color(0.3f, 0.6f, 1f, 0.15f);
+            Gizmos.DrawLine(a + left * halfWidth, b + left * halfWidth);
+            Gizmos.DrawLine(a - left * halfWidth, b - left * halfWidth);
+        }
+    }
+
+    void DrawAgents(float y)
+    {
+        for (var i = 0; i < _store.Count; i++)
+        {
+            var sfm = _store.SfmAgents[i];
+            var pos = new Vector3(sfm.Position.x, y, sfm.Position.y);
+            var r = sfm.Radius;
+
+            Gizmos.color = sfm.IsInjuredObstacle ? Color.red : Color.green;
+            Gizmos.DrawWireSphere(pos, r);
+
+            // Desired direction arrow.
+            if (sfm.DesiredDirection.sqrMagnitude > 1e-6f)
+            {
+                var dir = new Vector3(sfm.DesiredDirection.x, 0f, sfm.DesiredDirection.y);
+                Gizmos.DrawRay(pos, dir * (r + 0.2f));
+            }
+        }
     }
 }
